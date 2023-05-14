@@ -1,0 +1,953 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+
+### Executive Summary
+
+This file carries out a statistical analysis on protest data from Ukraine in 2013 (see file `2013_Events.xlsx`). In this data set, each row is a protest. To ask questions like "do arrests today predict for more protests tomorrow?" we need a different data set where each row is a day, and columns tell us how many protests happened that day, how many total arrests happened, etc. I wrangled the given data set into this form, which we call a *data frame*.
+
+There was one subtlety. In the original data, we had columns for Start Date and End Date of protests, and some went for as many as 148 days. So, before creating the second data frame, I added new rows to the first one, so that if a protest started say February 1 and ran until February 15, then we'd have 15 rows for it, and could correctly count the total number of protests in Ukraine that were happening on February 12 for example. In adding these new rows, I had to decide how to allocate "number of arrests" over the days of a long protest. I chose to allocate them uniformly, so for the example above, if there were 150 arrests, I would allocate 10 per day.
+
+Once I had the data frame with one row per day, I extracted several time series:
+1. Number of protests happening each day (`ts_p`)
+2. Number of arrests made each day (`ts_a`)
+3. Number of injuries to protesters each day (`ts_i`)
+4. Number of deaths of protesters each day (`ts_d`)
+5. Number of protesters each day (`ts_n`)
+
+For now, I ignored injuries and deaths to police officers, property damage, which state forces were involved, and ideology.
+
+Unfortunately, there are **serious missing data issues**. For example, the data claims there were only 8 deaths TOTAL in 2013. So `ts_d` is useless. The Excel file also shows that for the eight most serious protests (one with 800,000 protesters) that there were no arrests and no injuries. Fortunately, even though we are missing critical data, still we do see that injuries and arrests can be statistically significant explanatory variables.
+
+Similarly, the variable "number of protesters" is suspect because half of the protests we have data on are missing data for this variable, and we have no reason to believe it's random which row is missing data.
+
+For each of the five time series above, I determined the way in which it depended on its own past. I found, for example, that the number of protests today depends on the number of protests in each of the past three days, as well as the "error term" from yesterday and the day before. This "error term" (written MA below, for "moving average") tells whether the number of protests was more than we'd expect based on the model. Hence, it's telling us if the day in question was during a "hot" period of time.
+
+Lagplots and a cross-correlation analysis showed that arrests (`ts_a`) were more closely related to protests (`ts_p`) than injuries or deaths were. Both led to more protests in subsequent days. More arrests predicted for more protesters the next day. But, number of injuries did not. Rather, many protesters predicted for more injuries the next day. Perhaps the police cracked down harder when they saw lots of protesters.
+
+Our best models has covariates. The idea of a covariate is to explain the variability in the residuals and hence reduce the "noise" relative to the "signal" of our model. Here are the three covariates. The variable `NR` tells the number of "negative responses" by police during the day in question. The variable `EM` tells the number of Euromaidan protests per day. We also considered a model with a dummy variable `hot_time` that takes value 1 during the hottest time of the protest (e.g., dates after "11-23-13" or dates after "11-30-13") and value 0 otherwise. This latter variable is not useful in a model containing the other two, because the reason protests got hotter had to do with Euromaidan and negative responses.
+
+We carried out model selection based on the Akaite Information Criterion (AIC). The model with the best (lowest) AIC is meant to be the model that will do the best for forecasting. We have conclusions like "every injury is associated with 0.98 more protests in the coming days" and "every negative response is associated with 1.09 more protests in the coming days."
+
+Our best model for "number of protesters" from its own history, and the arrests time series (plus the covariates) yields conclusions like "controlling for type of protest and impact of the past, each arrest was associated with 950 more protesters in the subsequent days."
+
+I also created models with "number of injuries" and with "number of arrests" as response variables. We do get a statistically significant model for predicting "number of injuries" as a function of "number of protests" and for predicting "number of arrests" as a function of "number of protests".
+
+Lastly, I considered splitting off a separate time series of only the events occurring after the protests got hot (e.g., after November 30, 2013). On this time series, all the models were more significant. This makes sense, because the overall time series is really telling two very different stories: one about "normal" interactions between police and protesters in 2013 up until November, and one about the "Euromaidan" protests that overthrew the government. I expanded this last model, recasting it as a threshold model, and fitting it not only on the protests *after* the date cutoff but also before.
+
+### Setting up packages
+
+Import packages
+
+```{r,message=FALSE, warning = FALSE}
+# wrangling
+require(mosaic)
+require(stats)
+library(tidyverse)
+library(readxl)
+library(dplyr)
+
+# time series
+library(lmtest) # coeftest
+require(car)
+library("xts")
+library(astsa)
+library(forecast)
+library(dynlm)
+require(fBasics) # normality tests
+library(tseries) # augmented dickey fuller
+```
+
+### Read in the curated data set
+
+You may need to tweak the following block of code to read in the excel file on your machine.
+
+```{r,message=FALSE, warning = FALSE}
+original_data <- read_excel("2013_Events.xlsx", col_names = TRUE)
+```
+
+Basic facts about data:
+```{r}
+dim(original_data)
+```
+
+6627 rows, 36 columns.
+
+Checking column  names:
+
+```{r}
+names(original_data)
+```
+
+Relevant for us:
+- Event start data, Event end date
+- Action type
+- Actor-ideology
+- Event series (how to use this?)
+- Number of protesters
+- Number of civilians arrested
+- Number of civilians injured
+- Number of civilians killed
+- State forces involved in the conflict
+- Property damage
+- Number of state forces injured
+- Number of state forces killed
+
+Can't dig into easily:
+- Event (a paragraph description for each)
+- Oblast, Location: we are assuming all events are independent, e.g., location is not a factor in their impact.
+- Time (too often missing)
+
+Natural questions:
+- If state forces are involved, is this associated with more protests in the subsequent days?
+- Do the following three variables predict for number of protests in the subsequent days?
+-- Number of civilians arrested
+-- Number of civilians injured
+-- Number of civilians killed
+
+### Starting the analysis: data wrangling
+
+Forcing "Event start date" to actually be a "Date" object type in R.
+
+```{r}
+class(original_data$"Event start date")
+```
+
+Wrangle it so that date is a real time series:
+```{r}
+head(original_data$"Event start date")
+tail(original_data$"Event start date") # same format throughout
+
+# Use substring here to ditch the UTC part
+original_data$StartDate <- as.Date(substr(original_data$"Event start date",0,10), "%Y-%m-%d")
+head(original_data$StartDate)
+
+original_data$EndDate <- as.Date(substr(original_data$"Event end date",0,10), "%Y-%m-%d")
+head(original_data$EndDate)
+```
+
+### Investigate missing data
+
+How many protests are missing data on number of protesters present?
+```{r}
+dim(subset(original_data,is.na(original_data$`Number of protesters`)))
+```
+
+We are missing data in this field for 3044 out of 6627 protests. That's a lot. And if it's not missing "at random" but rather missing for some reason (e.g., missing for protests that were cracked down upon harshly) then the data is biased and we should not use it. In terms of how much non-missing data:
+```{r}
+dim(subset(original_data,!is.na(original_data$`Number of protesters`)))
+```
+
+3583 rows do have data on num protesters. It's basically half/half. Here's how to replace the NAs by zeros, if you choose to:
+```{r,eval=F}
+original_data$`Number of protesters`[is.na(original_data$`Number of protesters`)] <- 0
+```
+
+### Setting up to aggregate to daily level (each row is a day)
+
+Shortly, we will aggregate so that each row is a day. We want to know how many protests are happening each day. The problem is, the data given to us tells us when the protest starts and when it ends, but not all the days in between. So we are going to adjoin rows for the missing days. Since we only care about the number of days, these rows will be blank except for date.
+```{r}
+original_data$NumDays <- original_data$EndDate - original_data$StartDate+1
+
+head(original_data$NumDays)
+```
+
+Right away, we have to make a choice: Do we assuming all arrests, etc. happen on the first day of this protest? Or do we spread them out uniformly? We will return to this below.
+
+Let's check to see that each date appears multiple times:
+```{r,eval=F}
+unique(original_data$StartDate)
+count(original_data$StartDate=="2013-01-01")
+max(original_data$NumDays,na.rm = TRUE)
+subset(original_data,original_data$NumDays==148) # this is the longest protest
+```
+
+How many protests lasted for more than one day?
+```{r}
+dim(subset(original_data,original_data$NumDays>1))
+```
+
+Answer: 345
+
+Now it's time to add the new rows. We distribute the number of protesters, arrests, injuries, and deaths over all the days of the protest. So, for example, if a row represents a protest that went over 4 days, and had 100 arrests, we distribute them 25 in each day. The following dataframe, `original_data3` is the one we move ahead with. To run the code below takes about 10 seconds.
+
+```{r}
+emptyRow <- rep(NA,nrow(original_data))
+original_data3 <- original_data
+for (row in 1:nrow(original_data)) {
+  if(!is.na(original_data[row, "NumDays"])) {
+    days <- as.numeric(original_data[row, "NumDays"])
+    orig_days = days
+    while(days > 1) {
+      #print(days)
+        newRow <- emptyRow
+        newRow[2]=original_data[row,"StartDate"]+days-1
+        newRow[28]=original_data[row,"Number of protesters"]/orig_days
+        newRow[29]=original_data[row,"Number of civilians arrested"]/orig_days
+        newRow[30]=original_data[row,"Number of civilians injured"]/orig_days
+        newRow[31]=original_data[row,"Number of civilians killed"]/orig_days
+        newRow[32]=original_data[row,"Property damage"]
+        newRow[33]=original_data[row,"State forces involved in the conflict"]/orig_days
+        newRow[34]=original_data[row,"Number of state forces injured"]/orig_days
+        newRow[35]=original_data[row,"Number of state forces killed"]/orig_days
+        newRow[1]=original_data[row,"ID"]
+        newRow[19]=original_data[row,"Event series"]
+        
+        original_data3 <- rbind(original_data3,newRow)
+        #print(newRow[2])
+        days = days - 1
+    }
+  }
+}
+dim(original_data3)
+```
+
+Dim is 9361 rows and 39 columns.
+
+We replace the NAs by 0:
+```{r}
+original_data3$`Number of protesters`[is.na(original_data3$`Number of protesters`)] <- 0
+```
+
+We study the variable "Action type":
+```{r}
+head(subset(original_data3,original_data3$`Action type`=='negative response'))
+
+original_data3$NR <- as.numeric(original_data3$`Action type`=='negative response')
+
+favstats(original_data3$`NR`)
+
+original_data3$`NR`[is.na(original_data3$`NR`)] <- 0
+
+favstats(original_data3$`NR`)
+```
+
+There are 1102 protests with this "negative response" and next we'll aggregate them.
+
+We study the variable "Event Series":
+```{r}
+original_data3$EM <- str_detect(original_data3$`Event series`,'Euromaidan')
+
+original_data3$EM <- as.numeric(original_data3$EM)
+
+original_data3$`EM`[is.na(original_data3$`EM`)] <- 0
+
+favstats(original_data3$`EM`)
+
+dim(subset(original_data3,original_data3$`EM`==1))
+```
+
+There are 3220 protests where Event series contains "Euromaidan".
+
+### Aggregate to daily level
+
+Now we aggregate to the daily level, since in the excel file one day could have many protests. In the new dataset we are creating, every row is a day, and we have columns for "how many protests were there that day?" We also create columns for "how many protests where civilians were arrested/injured?" and "how many fatalities due to protests/riots on that day?"
+
+```{r}
+curated_daily <- original_data3 %>% 
+                  group_by(`Event start date`) %>% 
+                  summarise(num_protests = n(), 
+            civ_arrest = sum(`Number of civilians arrested`),
+              civ_inj = sum(`Number of civilians injured`),
+              civ_deaths = sum(`Number of civilians killed`),
+            num_protesters = sum(`Number of protesters`),
+            num_neg_resp = sum(`NR`),
+            num_euromaidan = sum(`EM`))
+            
+dim(curated_daily)
+head(curated_daily)
+```
+
+This dataframe has one row per day, with columns telling the number of protests, number of protesters, number of arrests, number of injuries, and number of protests where a negative response happened.
+
+Note: if you replace `n()` above by sum(`NumDays`) then you give all days to the first day.
+
+Wrangle it so that date is a real time series:
+```{r}
+head(curated_daily$"Event start date")
+
+curated_daily$Date <- as.Date(substr(curated_daily$"Event start date",0,10), "%Y-%m-%d")
+head(curated_daily$Date)
+```
+
+We convert the three columns to "xts" objects and to time series objects.
+
+```{r}
+dim(subset(curated_daily,is.na(curated_daily$Date)))
+dim(curated_daily)
+
+ts_daily_protests <- xts(curated_daily$num_protests, curated_daily$Date)
+
+ts_daily_arrest <- xts(curated_daily$civ_arrest, curated_daily$Date) 
+
+ts_daily_inj <- xts(curated_daily$civ_inj, curated_daily$Date) 
+
+ts_daily_deaths <- xts(curated_daily$civ_deaths, curated_daily$Date)
+
+ts_p <- ts(as.numeric(ts_daily_protests))
+ts_a <- ts(as.numeric(ts_daily_arrest))
+ts_i <- ts(as.numeric(ts_daily_inj))
+ts_d <- ts(as.numeric(ts_daily_deaths))
+```
+
+Some of these have missing data, for dates on which there was no protest. Clearly, for any such date, the number of protests, arrests, etc. were all zero.
+```{r}
+ts_p[is.na(ts_p)] <- 0
+ts_a[is.na(ts_a)] <- 0
+ts_i[is.na(ts_i)] <- 0
+ts_d[is.na(ts_d)] <- 0
+```
+
+
+
+### Exploratory data analysis
+
+We plot the three time series. 
+
+```{r}
+plot(ts_p)
+plot(ts_a)
+plot(ts_i)
+plot(ts_d)
+```
+
+None of these functions look recognizable as f(time), so we focus on ARIMA models. Note that the death time series has far too little data to be useful.
+
+The first step is to think about stationarity. From the plots above, `ts_p` is clearly not stationary but the others look stationary. The Augmented Dickey-Fuller test confirms this:
+```{r,warning=F}
+adf.test(ts_p)
+adf.test(ts_a)
+adf.test(ts_i)
+adf.test(ts_d)
+```
+
+This suggests that all our time series are stationary except for number of protests. We confirm the same with the KPSS test.
+```{r,warning=F}
+kpss.test(ts_p)
+kpss.test(ts_a)
+kpss.test(ts_i)
+kpss.test(ts_d)
+```
+
+Let's try to force `ts_p` to be stationary. Turns out first-order differencing is enough:
+```{r,warning=F}
+plot(diff(ts_p))
+adf.test(Arima(ts_p,order=c(0,1,0))$residuals)
+ts_p_stationary = Arima(ts_p,order=c(0,1,0))$residuals
+```
+
+The plot of `ts_p_stationary` looks a little bit like a GARCH model might fit. We did fit one, but it turned out to be worse than the ARIMA model we fit below, so we omit it from this file.
+
+#### Autocorrelations
+
+The first question is whether any of our time series have autocorrelation, e.g., the number of arrests yesterday being associated with the number today. We use the ACF and PACF to figure this out. We're looking for vertical bars going outside the blue error bounds, which means that correlation is statistically significant:
+```{r}
+acf(ts_a); pacf(ts_a) # arrests have no self lags
+acf(ts_i); pacf(ts_i) # injuries have no self lags
+
+# Omit deaths because this time series is useless
+#acf(ts_d); pacf(ts_d)
+```
+
+Let's check protests.
+```{r}
+acf(ts_p); pacf(ts_p) 
+```
+
+Here we see lots of autocorrelation. This tells us that we need to fit an ARIMA model to our data. A careful study of the ACF and PACF can also suggest which ARIMA model to fit, but we will instead use software to decide. It makes sense that the number of protests on Monday is correlated with the number on Tuesday (especially since some protests run for many days).
+
+### SARIMA model
+
+We use the `auto.arima` function to fit the best possible seasonal ARIMA model, i.e., the one that minimizes the AIC.
+
+```{r}
+acf(ts_p_stationary,40) # significant lags at 1,2,3, 7, 14
+pacf(ts_p_stationary,40) # significant lags all over the place
+
+# Instruct R to consider seasonal arima models with season 7
+ts_p <- ts(ts_p,frequency = 7)
+
+autoModProtests <- auto.arima(ts_p)
+autoModProtests
+```
+
+Auto ARIMA suggests ARIMA(2,1,3)(1,0,2)[7], which checks out with the lags we saw above and the need for differencing. We experimented with dropping variables but doing so made the model worse. So we stick with this model.
+
+We check the residuals of the auto arima model to be sure they look random (i.e., with no further pattern):
+
+```{r}
+res = resid(autoModProtests)
+tsplot(res)
+```
+
+This plot shows some heteroskedasticity. We attempted fitting a GARCH model to these residuals, but it complicated matters and didn't improve things.
+
+#### Lag plots and Cross-Correlation between the time series
+
+We study "cross correlation plots" and "lag plots" to figure out which of the time series lag behind the others. The *sample CCF* (cross-correlation function) is the set of sample correlations between $x_{t+h}$ and $y_t$ for integer $h$. When $h$ is negative, we are looking at a correlation between the x-variable at time $t-h$ (i.e., in the past) and the y-variable at time $t$. For example, the bar in the CCF for $h = -3$ gives the correlation between $x_{t-3}$ and $y_t$. To get the CCF we run the command *CCF(x-variable,y-variable)*.
+
+However, this cannot be done blindly. In order to correctly interpret the CCF, one of the two time series must be "white noise" meaning random and independent. The solution is to first prewhiten the data. This means, you fit an ARIMA model to $y_t$ and then use that model to transform $x_t$. You then study the CCF of the transformed $x_t$ and the residuals of the $y_t$ model (which are white noise).
+
+Much easier, from the perspective of exploratory data analysis, is to make lagplots, where we simply plot $y_t$ versus $x_{t+h}$. A flat line suggests no significant relationship between that lag (e.g., number of arrests 5 days ago) and protests today. We make a lag plot below. As you can see, most of these lines are flat.
+
+```{r}
+ts_i = ts(ts_i,frequency = 7)
+lag2.plot(ts_i, ts_p, 10)
+```
+
+The strongest correlation is "same day." Other than number of protests and injuries, the variables `ts_a`, `ts_d`, `ts_n`, are flawed due to missing data. Nevertheless, we make a lag plot for `ts_p` and `ts_a` and see that there are some associations with number of protests today and number of arrests today, yesterday, and two days ago.
+
+```{r}
+ts_p = ts(ts_p,frequency = 7)
+ts_a = ts(ts_a,frequency = 7)
+lag2.plot(ts_a, ts_p, 10)
+```
+
+We next investigate negative responses:
+
+```{r}
+ts_nr = ts(curated_daily$num_neg_resp,frequency = 7)
+lag2.plot(ts_nr, ts_p, 10)
+```
+
+We see much more correlation here: negative response clearly matters.
+
+We next investigate euromaidan:
+
+```{r}
+ts_e = ts(curated_daily$num_euromaidan,frequency = 7)
+lag2.plot(ts_e, ts_p, 10)
+```
+
+Again, here we see strong correlations. 
+
+The upside of lagplots is that we can visually see the correlations. The downside is that we cannot say "this correlation is statistically significant." For that, we need the CCF, which means we need to prewhiten the data.
+
+### Prewhitening and CCF
+
+We will use the `autoModProtests` as our best SARIMA model. 
+
+Step 1: Get the coefficients.
+```{r}
+summary(autoModProtests)
+```
+
+Step 2: apply the same filter to Arrests.
+```{r}
+phi = as.vector(autoModProtests$coef)
+phi # 1.45939321 -0.78990668 -1.83312516  1.19814769 -0.17196289  0.91906694 -0.91135099  0.09021678
+
+# turn those coefficients into the relevant vector of pi weights
+v = ARMAtoAR(ar=c(1.45939321,-0.78990668,0,0,0,0,0,0.91906694),ma=c(-1.83312516,1.19814769,-0.17196289,0,0,0,-0.91135099,0,0,0,0,0,0,0.09021678))
+#v
+
+# filter Arrests the same way: note that we need diff() because I = 1 in the arima above
+arrests_filtered = stats::filter(diff(ts_a), filter=c(1,-v), sides=1)
+```
+
+Step 3: make a CCF plot of the residuals of the auto SARIMA against the filtered Arrest series:
+```{r}
+protests_w = resid(autoModProtests)
+
+str(protests_w) # 1:409
+str(arrests_filtered) # 1:408
+
+arrests_filtered = ts(arrests_filtered,frequency = 7)
+
+# line up the series 
+both = ts.intersect(protests_w, arrests_filtered)
+Pw = both[,1] # Protests whitened
+Af = both[,2] # Arrests filtered
+ccf2(Pw, Af)
+```
+
+When interpreting this plot, we look for spikes near 0 or at 7, 14, etc. In this case, we don't see any such spikes. The bars we do see that go outside of the blue dotted error bounds are probably due to chance alone. There's no reason, for example, that arrests 4 weeks ago would be associated with number of protests today, but arrests 3 weeks ago would not. This plot shows that (probably due to missing data issues) there is no meaningful cross-correlation between number of protests and number of arrests.
+
+Now we make the CCF to compare injuries with number of protests. We've already prewhitened the protest time series so we know what filter to apply to the injuries series:
+```{r}
+# filter Injuries the same way: note that we need diff() because I = 1 in the arima above
+injuries_filtered = stats::filter(diff(ts_i), filter=c(1,-v), sides=1)
+
+protests_w = resid(autoModProtests)
+
+str(protests_w) # 1:409
+str(injuries_filtered) # 1:408
+
+injuries_filtered = ts(injuries_filtered,frequency = 7)
+
+# line up the series 
+both = ts.intersect(protests_w, injuries_filtered) 
+Pw = both[,1] # Protests whitened
+If = both[,2] # Arrests filtered
+ccf2(Pw, If)
+```
+
+This graph shows us a statistically significant positive correlation between the number of injuries today and the number of protests tomorrow. That means protests lag behind injuries.
+
+We next make the CCF for negative response events and number of protests:
+```{r}
+# filter NR the same way: note that we need diff() because I = 1 in the arima above
+nr_filtered = stats::filter(diff(ts(curated_daily$num_neg_resp)), filter=c(1,-v), sides=1)
+
+protests_w = resid(autoModProtests)
+
+str(protests_w) # 1:409
+str(nr_filtered) # 1:408
+
+nr_filtered = ts(nr_filtered,frequency = 7)
+
+# line up the series
+both = ts.intersect(protests_w, nr_filtered) 
+Pw = both[,1] # Protests whitened
+Nf = both[,2] # Arrests filtered
+ccf2(Pw, Nf)
+```
+
+As with the previous CCF, this shows that negative response events today are associated with more protests tomorrow.
+
+Lastly, we make the CCF for Euromaidan events and number of protests:
+```{r}
+# filter Euromaidan the same way: note that we need diff() because I = 1 in the arima above
+e_filtered = stats::filter(diff(ts(curated_daily$num_euromaidan)), filter=c(1,-v), sides=1)
+
+protests_w = resid(autoModProtests)
+
+str(protests_w) # 1:409
+str(e_filtered) # 1:408
+
+e_filtered = ts(e_filtered,frequency = 7)
+
+# line up the series 
+both = ts.intersect(protests_w, e_filtered) 
+Pw = both[,1] # Protests whitened
+Ef = both[,2] # Arrests filtered
+ccf2(Pw, Ef)
+```
+
+This shows that Euromaidan protests today or yesterday are associated with protests tomorrow.
+
+### Fitting ARIMA models
+
+Our next goal is to figure out exactly how the protest time series is associated with itself. Once we know this, we can start to predict the number of protests based on its own history and on the other time series. Recall its ACF, PACF, and time plot:
+```{r}
+acf(ts_p); pacf(ts_p); tsplot(ts_p)
+```
+
+These pictures suggest that we need to do a first-order differencing:
+
+```{r}
+pmod010 = Arima(ts_p,order=c(0,1,0))
+```
+
+Now we look at the ACF and PACF of those residuals, i.e., the differenced time series:
+```{r}
+tsdiag(pmod010)
+acf(pmod010$residuals)
+pacf(pmod010$residuals)
+```
+
+This suggests that even after first-order differencing we need 2 or 3 MA terms and 3 or 4 AR terms. We'll let `auto.arima` do the work of checking models:
+
+```{r}
+pmod312 = Arima(ts_p,order=c(3,1,2))
+tsdiag(pmod312)
+summary(pmod312) #sigma^2 estimated as 139.3
+checkresiduals(pmod312) # AICc=3179.87
+```
+
+The model it found is not bad. But it fails some of our diagnostics (most notably with the big lag 14 in ACF and also possible issues with heteroskedasticity and normality). The ACF shows that seasonal lags are required and this matches what we found before from the auto arima:
+
+```{r}
+AIC(pmod312) # 3179
+AIC(autoModProtests) # 3162.049, better. AICc=3162.5
+```
+
+Let's check the SARIMA:
+```{r}
+checkresiduals(autoModProtests)
+```
+
+These diagnostics look better. The biggest concern is that the residuals are not normal. They are more tightly concentrated in the middle. So, if you make a confidence interval based on the 1.96 multiplier then it won't be a 95% confidence interval but rather a 99.9% confidence interval, for example. What this means for us is that if we look at the summary output, we see that ar1 = 1.46 with SE = 0.07. That coefficient is much more than $1.96*SE$, so it's statistically significant. Similarly, a 95% confidence interval for sma2 = 0.09 will not look like $0.09 \pm 1.96*0.0576$ but rather will have a much smaller number than 1.96 as the multiplier. Hence, this term is still statistically significant.
+
+```{r}
+summary(autoModProtests)
+```
+
+We can determine the 95% cutoff bounds as follows:
+```{r}
+res = resid(autoModProtests)
+standardized = as.numeric((res - mean(res))/sd(res))
+quantile(standardized)
+
+alf = .025 # 95% CI
+quantile(standardized, probs = c(alf, 1-alf))
+```
+
+An alternative way to conclude that the coefficients are statistically significant is to do bootstrapping, as we now show. The idea of the code below is to run a loop where, in each loop, we randomize the residual vector, simulate new data (with the same SARIMA structure) from that random vector, fit the same model to this new data, and extract the relevant coefficient (whichever one we want to test the significance of). We end up with a distribution of coefficients produced randomly, using the original residuals (so the spread of this distribution is related to the variability in the original data set). If zero is not in the confidence interval, then we can reject the null hypothesis and conclude that this coefficient is statistically significantly different from zero. Equivalently, we can count the fraction of the simulations had a coefficient of zero or less, and that fraction is the p-value. First recall the coefficients from the SARIMA model we are testing.
+
+```
+Coefficients:
+         ar1      ar2      ma1     ma2      ma3    sar1     sma1    sma2
+      1.4594  -0.7899  -1.8331  1.1981  -0.1720  0.9191  -0.9114  0.0902
+s.e.  0.0702   0.0688   0.0913  0.1512   0.0742  0.0867   0.1048  0.0576
+```
+
+Now we create the simulation.
+
+```{r}
+# Easier to just hard code in the values:
+ar1 = 1.4594 # ar1 = auto_mod$coef[1]  
+ar2 = -0.7899
+ma1 = -1.8331
+ma2 = 1.1981
+ma3 = -0.1720
+sar1 = 0.9191
+sma1 = -0.9114
+sma2 = 0.0902 
+
+nboot = 500                 # number of bootstrap replicates
+resids = autoModProtests$residuals[-1]      # the sample_size-1 residuals (dropped the first)
+x.star = rep(0,409) # this will be the simulated time series
+ar1.star = c() # if I want to test the ar1 coefficient
+# Bootstrap
+for (i in 1:nboot) {
+ resid.star = sample(resids, replace=TRUE)
+ for (t in 15:(sample_size-1)) 
+ {
+  x.star[t+1] = ar1*(x.star[t]) + ar2*(x.star[t-1]) + ma1*resid.star[t-1] + ma2*resid.star[t-2]+ma3*resid.star[t-3]+sar1*x.star[t-7]+sma1*resid.star[t-7]+sma2*resid.star[t-14]+ resid.star[t]
+ }
+ fit_boot = sarima(x.star, 2,0,3,1,0,2, xreg = ts_daily_kips)
+ 
+ ar1.star[i] = fit_boot$coef[1] 
+ x.star = rep(0,437)
+}
+
+densityplot(ar1.star)
+```
+
+From the above distribution we can easily extract a 95% confidence interval of potential values of the ar1 coefficient.
+
+```{r}
+# CIs 
+alf = .025 # 95% CI
+quantile(ar1.star, probs = c(alf, 1-alf))
+```
+
+From this confidence interval, we can see that zero is outside the confidence interval and hence the ar1 coefficient is statistically significantly different from zero. This analysis can easily be repeated for any other coefficient. To save space, we have omitted the code for those slight tweaks of the code above.
+
+### Fitting models for protests as a function of arrests
+
+In this section, we fit a model for protests as a function of arrests. We use the auto arima function instead of the iterative approach with ACF and PACF.
+
+```{r}
+auto_mod = auto.arima(ts_p, xreg = ts_a)
+summary(auto_mod)
+```
+
+The software is telling us the best model for protests today depends on protests in the past 3 days, plus two MA terms, plus the number of arrests today. The MA terms are correlations between (number of protests today) and (error terms from yesterday and day before). Those error terms are telling us if we're seeing more protests than expected. This has to do with how "hot" things are right now. Basically, to predict number of protests on Thursday, I should know numbers on Monday, Tuesday, and Wednesday, plus whether or not Tuesday and Wednesday were "hotter" than normal.
+
+Let's check the residuals of our auto model and see if we've correctly factored in the whole history:
+```{r}
+checkresiduals(auto_mod)
+pacf(auto_mod$residuals)
+```
+
+This looks good. We might be mildly concerned about the lag at 14, since our data is daily and 14 is 2 weeks ago, but with no significant lag at 7 or 21, it seems a weekly effect is not needed. We can use this model to test if the "number of arrests" is a statistically significant predictor for "number of protests."
+
+```{r}
+coeftest(auto_mod)
+```
+
+Answer: no, it is not. This makes sense, given the cross-correlation analysis we carried out above. Similar code checks that the number of injuries or deaths are not useful for predicting the number of protests, probably due to missing data issues.
+
+### Models for number of protests based on negative response events
+
+The CCF analysis taught us that $ts_p$ is closely related with $ts_{i-1}$ so we first try including that in our model.
+
+```{r}
+# First, using only yesterday
+pp = as.zoo(ts.intersect(ts_p, IL1 = stats::lag(ts_i,-1)))
+
+auto_modpi = auto.arima(pp$ts_p, xreg = pp$IL1) # note xreg not even significant
+summary(auto_modpi) # AICc=3158.23; worse than the previous one
+
+# Using today and yesterday
+pp = as.zoo(ts.intersect(ts_p, ts_i, IL1 = stats::lag(ts_i,-1)))
+
+auto_modpi = auto.arima(pp$ts_p, xreg = cbind(pp$ts_i, pp$IL1)) 
+summary(auto_modpi) # AICc=3134.14; better than the previous one
+
+# Now with two lags
+pp = as.zoo(ts.intersect(ts_p, ts_i, IL1 = stats::lag(ts_i,-1),IL2 = stats::lag(ts_i,-2)))
+
+auto_modpi = auto.arima(pp$ts_p, xreg = cbind(pp$ts_i, pp$IL1,pp$IL2)) 
+summary(auto_modpi) # AICc=3133.7; better than the previous one
+
+# Now with three lags
+pp = as.zoo(ts.intersect(ts_p, ts_i, IL1 = stats::lag(ts_i,-1),IL2 = stats::lag(ts_i,-2), IL3 = stats::lag(ts_i,-3)))
+
+auto_modpi = auto.arima(pp$ts_p, xreg = cbind(pp$ts_i, pp$IL1,pp$IL2,pp$IL3)) 
+summary(auto_modpi) # AICc=3144.64; worse
+```
+
+The best was to use two lags. Next we bring in negative response:
+
+```{r}
+ts_nr = ts(curated_daily$num_neg_resp,frequency = 7)
+
+# First, using only yesterday
+pp = as.zoo(ts.intersect(ts_p, IL1 = stats::lag(ts_nr,-1)))
+
+auto_modpi = auto.arima(pp$ts_p, xreg = pp$IL1) # note xreg not even significant
+summary(auto_modpi) # AICc=3157.89; worse than ts_p alone
+
+# Using today and yesterday
+pp = as.zoo(ts.intersect(ts_p, ts_nr, IL1 = stats::lag(ts_nr,-1)))
+
+auto_modpi = auto.arima(pp$ts_p, xreg = cbind(pp$ts_nr, pp$IL1)) 
+summary(auto_modpi) # AICc=2988.27; much better
+
+# Now with two lags
+pp = as.zoo(ts.intersect(ts_p, ts_nr, IL1 = stats::lag(ts_nr,-1),IL2 = stats::lag(ts_nr,-2)))
+
+auto_modpi = auto.arima(pp$ts_p, xreg = cbind(pp$ts_nr, pp$IL1,pp$IL2)) 
+summary(auto_modpi) # AICc=2982.2; better than the previous one
+
+# Now with three lags
+pp = as.zoo(ts.intersect(ts_p, ts_nr, IL1 = stats::lag(ts_nr,-1),IL2 = stats::lag(ts_nr,-2), IL3 = stats::lag(ts_nr,-3)))
+
+auto_modpi = auto.arima(pp$ts_p, xreg = cbind(pp$ts_nr, pp$IL1,pp$IL2,pp$IL3)) 
+summary(auto_modpi) # AICc=2977.34, still better, but IL3 not significant
+
+```
+
+Again, the best was to use two lags. Lastly, we bring in euromaidan:
+
+```{r}
+ts_e = ts(curated_daily$num_euromaidan,frequency = 7)
+
+# First, using only yesterday
+pp = as.zoo(ts.intersect(ts_p, IL1 = stats::lag(ts_e,-1)))
+
+auto_modpi = auto.arima(pp$ts_p, xreg = pp$IL1) # note xreg not even significant
+summary(auto_modpi) # AICc=3121.37; better than ts_p alone
+
+# Using today and yesterday
+pp = as.zoo(ts.intersect(ts_p, ts_e, IL1 = stats::lag(ts_e,-1)))
+
+auto_modpi = auto.arima(pp$ts_p, xreg = cbind(pp$ts_e, pp$IL1)) 
+summary(auto_modpi) # AICc=2797.81; much better
+
+# Using two lags
+pp = as.zoo(ts.intersect(ts_p, ts_e, IL1 = stats::lag(ts_e,-1),IL2 = stats::lag(ts_e,-2)))
+
+auto_modpi = auto.arima(pp$ts_p, xreg = cbind(pp$ts_e, pp$IL1,pp$IL2)) 
+summary(auto_modpi) # AICc=2778.17; better than the previous one
+
+# Using three lags
+pp = as.zoo(ts.intersect(ts_p, ts_e, IL1 = stats::lag(ts_e,-1),IL2 = stats::lag(ts_e,-2), IL3 = stats::lag(ts_e,-3)))
+
+auto_modpi = auto.arima(pp$ts_p, xreg = cbind(pp$ts_e, pp$IL1,pp$IL2,pp$IL3)) 
+summary(auto_modpi) # AICc=2773.55, still better, but IL3 not significant
+```
+
+So again, two lags is the best. We used these techniques to make models for injuries, deaths, and number of protesters, but we omit those models because of the missing data issues in those variables.
+
+### Creating dummy variable `hot_time`
+
+In this section, we create a dummy variable `hot_time` that takes value 1 during the hottest time of the protest and value 0 otherwise. We use this variable as a covariate, and to disentangle longer-term correlations between two time series (e.g., if normally injuries followed number of protesters) from the short-term correlations during this hot period that experts write was quantitatively different from the rest of the protest (e.g., if during this hot period protesters came out stronger after injuries). Since the time series only spikes once, a model with this covariate is equivalent to a threshold model. First we create the new variable:
+
+```{r}
+original_data3$hot_time <- ifelse(original_data3$StartDate > "2013-11-23", 1, 0)
+
+#tail(subset(original_data3,original_data3$hot_time==1))
+
+curated_daily$hot_time <- ifelse(curated_daily$Date > "2013-11-23", 1, 0)
+tail(curated_daily)
+```
+
+Next, we use this variable in the model.
+
+```{r}
+xreg_ah <- cbind(ts_a,curated_daily$hot_time)
+colnames(xreg_ah) <- c("arr","hot")
+```
+
+The response variable now is number of protests. First, we model it as a function of number of arrests.
+```{r}
+xreg_ah <- cbind(ts_a,curated_daily$hot_time)
+colnames(xreg_ah) <- c("arr","hot")
+
+auto_mod_pah = auto.arima(ts_p, xreg = xreg_ah)
+cor(fitted(auto_mod_pah),ts_p)^2 
+summary(auto_mod_pah) # still small impact: 0.22 more protests for each arrest
+coeftest(auto_mod_pah) # all significant
+tsdiag(auto_mod_pah) # fails Ljung-Box at the end.
+```
+
+This new variable certainly leads to a better model than we had before, but the missing data issues with the arrest variable (and injuries and deaths, not shown) still cause weakness in the model.
+
+#### Number of negative responses
+
+In this section, we fit a model for the number of protests based on the number of negative response events.
+
+```{r}
+ts_nr = ts(curated_daily$num_neg_resp,frequency = 7)
+
+explanatory = cbind(ts_a,ts_i,ts_nr) # AICc=3018.34
+auto_mod = auto.arima(ts_p, xreg = explanatory)
+summary(auto_mod)
+```
+
+This new variable `NR` is clearly highly significant.
+
+#### Euromaidan variable
+
+In this section, we fit a model for the number of protests based on the number of Euromaidan protests, stored as `num_euromaidan`:
+```{r}
+ts_e = ts(curated_daily$num_euromaidan,frequency = 7)
+
+explanatory = cbind(ts_a,ts_i,ts_nr,ts_e)
+auto_mod = auto.arima(ts_p, xreg = explanatory) # AICc=2680.58, much better!
+summary(auto_mod)
+```
+
+Now we have a much better AIC, and most things are significant (`num_injuries`, `num_neg_response`, `num_euromaidan`). Note that `num_arrests` is not significant, so we drop it.
+
+```{r}
+explanatory = cbind(ts_i,curated_daily$num_neg_resp,curated_daily$num_euromaidan)
+auto_mod = auto.arima(ts_p, xreg = explanatory) # AICc=2680.24, better than the above!
+summary(auto_mod)
+
+checkresiduals(auto_mod)
+```
+
+The resulting model is better; one should not use `ts_a`. Also, the diagnostics are good: we have no lags of concern, no heteroskedasticity, but still a lack of normality (now a bit of skewness). Since n = 409 is large, we can still proceed with the approximate normality of the coefficients, or can bootstrap as above. We fit models with more lags but they were not significant. We also determined that, in a model that already includes the number of negative response events and the number of euromaidan protests, we do not need the `hot_time` variable:
+
+```{r}
+explanatory = cbind(ts_a,ts_i,curated_daily$num_neg_resp,curated_daily$num_euromaidan,curated_daily$hot_time)
+auto_mod = auto.arima(ts_p, xreg = explanatory)
+summary(auto_mod)
+```
+
+The same conclusion holds even if you try different dates for what constitutes the "hot time":
+```{r}
+original_data3$hot_time30 <- ifelse(original_data3$StartDate > "2013-11-29", 1, 0)
+
+curated_daily$hot_time30 <- ifelse(curated_daily$Date > "2013-11-29", 1, 0)
+
+explanatory = cbind(ts_a,ts_i,curated_daily$num_neg_resp,curated_daily$num_euromaidan,curated_daily$hot_time30)
+auto_mod = auto.arima(ts_p, xreg = explanatory)
+summary(auto_mod) 
+```
+
+### Threshold model
+
+The idea here is to select a threshold, $r$, and fit two ARIMA models: one for all times when $y_t \leq r$ and one for all times when $y_t > r$. We only focus on the time series $ts_p$ of number of protests. Note the numbers below:
+
+```{r}
+curated_daily[320:333,]
+```
+
+Clearly, the big jump occurred on 2013-11-22, when there were 90 protests. I wrote about this in the paper. We already fit a model above for what happened after "2013-11-23". Now let's do it for after "2013-11-21".
+
+```{r}
+laterTimeDF <- subset(original_data3,original_data3$StartDate > "2013-11-21")
+```
+
+We make a curated data frame for the later time period:
+```{r}
+curated_daily_later <- laterTimeDF %>% 
+                  group_by(`Event start date`) %>% 
+                  summarise(num_protests = n(), 
+            civ_arrest = sum(`Number of civilians arrested`),
+              civ_inj = sum(`Number of civilians injured`),
+              civ_deaths = sum(`Number of civilians killed`),
+            num_protesters = sum(`Number of protesters`),
+            num_neg_resp = sum(`NR`),
+            num_euromaidan = sum(`EM`))
+            
+dim(curated_daily_later)
+head(curated_daily_later)
+```
+
+We make ts objects for later time:
+```{r}
+curated_daily_later$Date <- as.Date(substr(curated_daily_later$"Event start date",0,10), "%Y-%m-%d")
+
+ts_daily_protests <- xts(curated_daily_later$num_protests, curated_daily_later$Date)
+
+ts_daily_arrest <- xts(curated_daily_later$civ_arrest, curated_daily_later$Date) 
+
+ts_daily_inj <- xts(curated_daily_later$civ_inj, curated_daily_later$Date) 
+
+ts_daily_deaths <- xts(curated_daily_later$civ_deaths, curated_daily_later$Date)
+
+ts_pl <- ts(as.numeric(ts_daily_protests))
+ts_al <- ts(as.numeric(ts_daily_arrest))
+ts_il <- ts(as.numeric(ts_daily_inj))
+ts_dl <- ts(as.numeric(ts_daily_deaths))
+
+ts_pl[is.na(ts_pl)] <- 0
+ts_al[is.na(ts_al)] <- 0
+ts_il[is.na(ts_il)] <- 0
+ts_dl[is.na(ts_dl)] <- 0
+
+ts_num_protesters <- xts(curated_daily_later$num_protesters, curated_daily_later$Date)
+ts_nl = ts(as.numeric(ts_num_protesters))
+ts_nl[is.na(ts_nl)] <- 0
+
+```
+
+We fit our best model on this new time period:
+```{r}
+explanatory = cbind(ts_al,ts_il,curated_daily_later$num_neg_resp,curated_daily_later$num_euromaidan)
+auto_mod = auto.arima(ts_pl, xreg = explanatory)
+summary(auto_mod)
+```
+
+We study the first part of the year (i.e., the model for y_t below the threshold).
+
+```{r}
+earlyTimeDF <- subset(curated_daily,curated_daily$Date < "2013-11-22")
+
+curated_daily_early <- earlyTimeDF
+
+ts_daily_protests <- xts(curated_daily_early$num_protests, curated_daily_early$Date)
+
+ts_daily_arrest <- xts(curated_daily_early$civ_arrest, curated_daily_early$Date) 
+
+ts_daily_inj <- xts(curated_daily_early$civ_inj, curated_daily_early$Date) 
+
+ts_daily_deaths <- xts(curated_daily_early$civ_deaths, curated_daily_early$Date)
+
+ts_pl <- ts(as.numeric(ts_daily_protests))
+ts_al <- ts(as.numeric(ts_daily_arrest))
+ts_il <- ts(as.numeric(ts_daily_inj))
+ts_dl <- ts(as.numeric(ts_daily_deaths))
+
+ts_pl[is.na(ts_pl)] <- 0
+ts_al[is.na(ts_al)] <- 0
+ts_il[is.na(ts_il)] <- 0
+ts_dl[is.na(ts_dl)] <- 0
+```
+
+We fit a model on the early time period:
+```{r}
+auto.arima(ts_pl) # ARIMA(1,1,2), AICc=2260.32
+
+neg_resp = curated_daily_early$num_neg_resp
+auto_mod = auto.arima(ts_pl, xreg = cbind(ts_il,neg_resp))
+summary(auto_mod) # AICc=AICc=2107.28
+
+checkresiduals(auto_mod)
+```
+
+This model is better than blindly using the full year model on just the first part of the year. Note that there's no heteroskedasticity. The residuals are not normal but our large sample size (n = 325) menas we don't need them to be.
+
+The threshold and ARIMA models illustrate that the data do exhibit self-excitation behavior.
+
+
+
