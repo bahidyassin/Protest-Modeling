@@ -4,9 +4,15 @@ In this repository, we present the code used to generate the figures and fitting
 
 #### File Structure:
 |
+
 |
+
 +--arima_protest_ukraine_journal.Rmd : Presents the statistical analysis used.
+
 |
+
 +-- Hawkes_comparative_study.ipynb : Presents the different iteration of Hawkes processses used to model Euromaidan.
+
 |
+
 +-- Raw Data Exploration.ipyns : Presents plots and figures of the raw data and the spatio-temporal beharvior during Euromaidan.
